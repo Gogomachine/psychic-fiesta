@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Connect Dots — Glow</title>
+<style>
+  :root{--bg:#171717;--accent:#fff;--success:#29d0c2;--warning:#f79a2b;--danger:#e0434f;}
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;}
+  body{background:var(--bg); display:flex; justify-content:center; color:var(--accent); overflow:hidden;}
+  .wrap{width:100%; max-width:420px; padding:20px; box-sizing:border-box;}
+  header{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+  .score{font-size:28px; font-weight:600; transition:color 0.3s;}
+  .score.bonus{color:var(--success);}
+  .score.penalty{color:var(--danger);}
+  .timer{font-size:28px; font-weight:600; transition:color 0.3s;}
+  .timer.paused{color:var(--warning); animation:pulse 1s infinite;}
+  .timer.warning{color:var(--danger);}
+  .btn{background:transparent; color:#ccc; border:1px solid rgba(255,255,255,0.1);
+       padding:8px 12px; border-radius:10px; font-size:14px; cursor:pointer; 
+       transition:all 0.3s;}
+  .btn:hover{background:rgba(255,255,255,0.1); border-color:rgba(255,255,255,0.3);}
+  #game{touch-action:none; display:block; border-radius:12px;}
+  .bar-bg{width:100%; height:14px; background:#2a2a2a; border-radius:10px; overflow:hidden; margin-bottom:14px;}
+  .bar-fill{height:100%; width:100%; background:linear-gradient(90deg,#29d0c2,#f79a2b,#5b4af0,#e0434f);
+            border-radius:10px; transition:width 0.5s ease-out; transform-origin:right;}
+  .hint{color:#999; font-size:13px; text-align:center; margin-top:12px; line-height:1.4;}
+  .flash{position:fixed; top:0; left:0; width:100%; height:100%; background:red; opacity:0; 
+         pointer-events:none; transition:opacity 0.1s;}
+  .gameover{position:fixed; top:0; left:0; width:100%; height:100%; 
+            background:rgba(0,0,0,0.8); display:none; align-items:center; justify-content:center;
+            backdrop-filter:blur(5px);}
+  .gameover-content{text-align:center; color:#fff; padding:40px;}
+  .gameover-title{font-size:48px; margin-bottom:20px; animation:glow 2s infinite alternate;}
+  .gameover-score{font-size:24px; margin-bottom:30px; color:#ccc;}
+  .gameover-btn{background:var(--success); color:#fff; border:none; padding:12px 24px; 
+               border-radius:12px; font-size:16px; cursor:pointer; transition:all 0.3s;}
+  .gameover-btn:hover{background:#22b3a6; transform:translateY(-2px);}
+  
+  .combo{position:absolute; font-size:20px; color:var(--success); font-weight:bold;
+         pointer-events:none; animation:comboAnim 1s ease-out forwards;}
+  
+  @keyframes pulse{0%,100%{opacity:1;} 50%{opacity:0.5;}}
+  @keyframes glow{0%{text-shadow:0 0 20px #fff;} 100%{text-shadow:0 0 30px #fff, 0 0 40px #29d0c2;}}
+  @keyframes comboAnim{0%{transform:translateY(0) scale(1); opacity:1;} 
+                      100%{transform:translateY(-50px) scale(1.5); opacity:0;}}
+  
+
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="timer" id="timer">60</div>
+      <div class="score" id="score">0</div>
+      <button class="btn" id="restart">🔄 Restart</button>
+    </header>
+    <div class="bar-bg"><div class="bar-fill" id="progress"></div></div>
+    <canvas id="game" width="420" height="560"></canvas>
+    <div class="hint">
+      <strong>Цель:</strong> Набрать максимум очков за 60 секунд! 🎯<br>
+      2 круга = +2 очка 🟡 | 3+ кругов = больше очков ✨<br>
+      5+ кругов = пауза таймера на 5с ⏸️<br>
+      <em>Соединяй по диагонали для лучших комбо!</em>
+    </div>
+  </div>
+  <div class="flash" id="flash"></div>
+
+  <div class="gameover" id="gameover">
+    <div class="gameover-content">
+      <div class="gameover-title">GAME OVER</div>
+      <div class="gameover-score">Ваш счёт: <span id="finalScore">0</span></div>
+      <button class="gameover-btn" id="playAgain">🎮 Играть снова</button>
+    </div>
+  </div>
+
+<script>
+/* --- CONFIG --- */
+const ROWS=4,COLS=4;
+const DOT_RADIUS=32,GAP=18;
+const COLORS=["#29d0c2","#f79a2b","#5b4af0","#e0434f"];
+const SCORE_PER=10;
+const GAME_TIME=60;
+
+/* --- DOM --- */
+const canvas=document.getElementById('game'),ctx=canvas.getContext('2d');
+const scoreEl=document.getElementById('score');
+const progressEl=document.getElementById('progress');
+const restartBtn=document.getElementById('restart');
+const flashEl=document.getElementById('flash');
+const timerEl=document.getElementById('timer');
+const gameOverEl=document.getElementById('gameover');
+const finalScoreEl=document.getElementById('finalScore');
+const playAgainBtn=document.getElementById('playAgain');
+const pauseOverlayEl=null;
+
+/* --- STATE --- */
+let grid=[],score=0,chain=[],chainSet=new Set(),dragging=false,lastPos=null,particles=[];
+let timeLeft=GAME_TIME,paused=false,timerInterval=null,gameOver=false,pauseTimeLeft=0;
+let animationId=null;
+
+/* --- SOUND EFFECTS (Web Audio API) --- */
+const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+
+function playSound(frequency, duration, type='sine', volume=0.03) {
+  try {
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    
+    oscillator.frequency.value = frequency;
+    oscillator.type = type;
+    
+    gain.gain.setValueAtTime(volume, audioContext.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + duration);
+    
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + duration);
+  } catch (e) {
+    console.log('Audio not supported');
+  }
+}
+
+/* --- INIT GRID --- */
+function fillGrid(){
+  function hasPair(){
+    for(let r=0;r<ROWS;r++){
+      for(let c=0;c<COLS;c++){
+        const col=grid[r][c].color;
+        if(r+1<ROWS && grid[r+1][c].color===col) return true;
+        if(c+1<COLS && grid[r][c+1].color===col) return true;
+        // Проверка диагоналей
+        if(r+1<ROWS && c+1<COLS && grid[r+1][c+1].color===col) return true;
+        if(r+1<ROWS && c-1>=0 && grid[r+1][c-1].color===col) return true;
+      }
+    }
+    return false;
+  }
+  
+  let attempts = 0;
+  do {
+    if(attempts++ > 100) break; // Предотвращение бесконечного цикла
+    grid=[];
+    for(let r=0;r<ROWS;r++){
+      const row=[];
+      for(let c=0;c<COLS;c++){
+        row.push({color:Math.floor(Math.random()*COLORS.length),y:0,falling:false});
+      }
+      grid.push(row);
+    }
+  } while(!hasPair());
+}
+
+/* --- LAYOUT --- */
+function layout(){
+  const rect=canvas.getBoundingClientRect();
+  const totalWidth = COLS*DOT_RADIUS*2+(COLS-1)*GAP;
+  const startX = (canvas.width - totalWidth)/2 + DOT_RADIUS;
+  const startY = 100;
+  const pos=[];
+  for(let r=0;r<ROWS;r++){
+    const row=[];
+    for(let c=0;c<COLS;c++){
+      row.push({x:startX+c*(DOT_RADIUS*2+GAP),y:startY+r*(DOT_RADIUS*2+GAP)});
+    }
+    pos.push(row);
+  }
+  return pos;
+}
+
+/* --- IMPROVED DRAW --- */
+function clear(){ctx.clearRect(0,0,canvas.width,canvas.height);}
+
+function draw(){
+  clear();
+  const pos=layout();
+
+  // Улучшенная линия свечения
+  if(chain.length>0){
+    ctx.save();
+    
+    // Внешнее свечение
+    ctx.beginPath();
+    for(let i=0;i<chain.length;i++){
+      const p=pos[chain[i].r][chain[i].c];
+      const dot = grid[chain[i].r][chain[i].c];
+      if(i===0) ctx.moveTo(p.x,p.y + dot.y);
+      else ctx.lineTo(p.x,p.y + dot.y);
+    }
+    if(lastPos) ctx.lineTo(lastPos.x,lastPos.y);
+    
+    ctx.strokeStyle="rgba(255,255,255,0.3)";
+    ctx.lineWidth=20; 
+    ctx.lineCap="round";
+    ctx.shadowColor="white"; 
+    ctx.shadowBlur=20;
+    ctx.stroke();
+    
+    // Внутренняя линия
+    ctx.strokeStyle="rgba(255,255,255,0.8)";
+    ctx.lineWidth=8;
+    ctx.shadowBlur=5;
+    ctx.stroke();
+    
+    ctx.restore();
+  }
+
+  // Улучшенная отрисовка точек
+  for(let r=0;r<ROWS;r++) {
+    for(let c=0;c<COLS;c++){
+      const d=grid[r][c],p=pos[r][c];
+      const isSelected = chainSet.has(r+","+c);
+      
+      ctx.save();
+      
+      // Тень для точки
+      if(!isSelected) {
+        ctx.beginPath();
+        ctx.fillStyle="rgba(0,0,0,0.3)";
+        ctx.arc(p.x+2,p.y+d.y+2,DOT_RADIUS,0,Math.PI*2);
+        ctx.fill();
+      }
+      
+      // Основная точка
+      ctx.beginPath();
+      ctx.fillStyle=COLORS[d.color];
+      if(isSelected) {
+        ctx.shadowColor=COLORS[d.color];
+        ctx.shadowBlur=15;
+      }
+      ctx.arc(p.x,p.y+d.y,DOT_RADIUS,0,Math.PI*2);
+      ctx.fill();
+      
+      // Выделение выбранных точек
+      if(isSelected){
+        ctx.beginPath();
+        ctx.strokeStyle="#fff"; 
+        ctx.lineWidth=4;
+        ctx.shadowColor="white";
+        ctx.shadowBlur=10;
+        ctx.arc(p.x,p.y+d.y,DOT_RADIUS-2,0,Math.PI*2);
+        ctx.stroke();
+      }
+      
+      ctx.restore();
+    }
+  }
+
+  // Улучшенные частицы
+  particles=particles.filter(pt=>{
+    if(pt.life <= 0) return false;
+    
+    ctx.save();
+    ctx.beginPath();
+    ctx.fillStyle=`rgba(${pt.r},${pt.g},${pt.b},${pt.life})`;
+    ctx.shadowColor=`rgb(${pt.r},${pt.g},${pt.b})`;
+    ctx.shadowBlur=pt.size*2;
+    ctx.arc(pt.x,pt.y,pt.size,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+    
+    pt.x+=pt.vx; 
+    pt.y+=pt.vy; 
+    pt.vy+=0.1; // гравитация
+    pt.life-=0.015;
+    pt.size*=0.99; // уменьшение размера
+    
+    return true;
+  });
+}
+
+/* --- IMPROVED INPUT HELPERS --- */
+function nearestCell(p){
+  const pos=layout();
+  let nearest = null;
+  let minDist = Infinity;
+  
+  for(let r=0;r<ROWS;r++) {
+    for(let c=0;c<COLS;c++){
+      const dot = grid[r][c];
+      const d=Math.hypot(p.x-pos[r][c].x,p.y-(pos[r][c].y + dot.y));
+      if(d < DOT_RADIUS && d < minDist) {
+        minDist = d;
+        nearest = {r,c};
+      }
+    }
+  }
+  return nearest;
+}
+
+function neighbors(a,b){
+  return Math.abs(a.r-b.r) <= 1 && Math.abs(a.c-b.c) <= 1 && !(a.r===b.r && a.c===b.c);
+}
+
+function chainPush(r,c){chain.push({r,c}); chainSet.add(r+","+c);}
+
+function showCombo(text, x, y) {
+  const comboEl = document.createElement('div');
+  comboEl.className = 'combo';
+  comboEl.textContent = text;
+  comboEl.style.left = x + 'px';
+  comboEl.style.top = y + 'px';
+  document.body.appendChild(comboEl);
+  
+  setTimeout(() => {
+    document.body.removeChild(comboEl);
+  }, 1000);
+}
+
+/* --- IMPROVED EVENTS --- */
+function start(e){
+  if(gameOver) return; 
+  e.preventDefault(); 
+  
+  // Возобновить аудио контекст при первом взаимодействии
+  if(audioContext.state === 'suspended') {
+    audioContext.resume();
+  }
+  
+  dragging=true; 
+  chain=[];
+  chainSet.clear();
+  
+  const p=getPos(e);
+  const cell=nearestCell(p); 
+  if(cell){
+    chainPush(cell.r,cell.c);
+    playSound(300, 0.05);
+  } 
+  lastPos=p; 
+  draw();
+}
+
+function move(e){
+  if(!dragging||gameOver) return; 
+  
+  const p=getPos(e); 
+  lastPos=p;
+  const cell=nearestCell(p); 
+  
+  if(cell){
+    const last=chain[chain.length-1];
+    if(last && neighbors(last,cell) && 
+       grid[cell.r][cell.c].color===grid[last.r][last.c].color && 
+       !chainSet.has(cell.r+","+cell.c)){
+      chainPush(cell.r,cell.c);
+      playSound(400 + chain.length * 30, 0.05);
+    }
+  }
+  draw();
+}
+
+function end(e){
+  if(!dragging||gameOver) return; 
+  dragging=false; 
+  lastPos=null;
+  
+  if(chain.length>=2){
+    const pos=layout();
+    const color=grid[chain[0].r][chain[0].c].color;
+    let [r,g,b]=hex2rgb(COLORS[color]);
+    let scoreChange = 0;
+
+    // Создание частиц для каждой точки в цепи
+    chain.forEach(c=>{
+      const p=pos[c.r][c.c];
+      const particleCount = Math.min(chain.length + 3, 12);
+      for(let i=0;i<particleCount;i++) {
+        particles.push({
+          x:p.x + (Math.random()-0.5)*DOT_RADIUS,
+          y:p.y + (Math.random()-0.5)*DOT_RADIUS,
+          vx:(Math.random()-0.5)*4,
+          vy:(Math.random()-0.5)*4 - 1,
+          size:Math.random()*4+2,
+          life:1,
+          r,g,b
+        });
+      }
+      grid[c.r][c.c].color=Math.floor(Math.random()*COLORS.length);
+    });
+
+    if(chain.length===2){
+      // Штраф времени за 2 круга
+      scoreChange = 2;
+      score += scoreChange;
+      
+      // Убавляем время
+      timeLeft = Math.max(0, timeLeft - 8);
+      timerEl.textContent = timeLeft;
+      
+      // Обновляем полоску времени
+      const timeProgress = (timeLeft / GAME_TIME) * 100;
+      progressEl.style.width = timeProgress + "%";
+      
+      // Визуальные эффекты штрафа
+      scoreEl.classList.remove('bonus');
+      scoreEl.classList.add('penalty');
+      setTimeout(() => scoreEl.classList.remove('penalty'), 500);
+      
+      // Красные частицы для штрафа времени
+      [r,g,b]=[255,60,60];
+      chain.forEach(c=>{
+        const p=pos[c.r][c.c];
+        for(let i=0;i<6;i++) {
+          particles.push({
+            x:p.x,y:p.y,
+            vx:(Math.random()-0.5)*4,
+            vy:(Math.random()-0.5)*4,
+            size:Math.random()*4+2,
+            life:0.8,r,g,b
+          });
+        }
+      });
+      
+      playSound(200, 0.1, 'square', 0.02);
+      if(navigator.vibrate) navigator.vibrate(50);
+      
+      // Показать штраф времени
+      const rect = canvas.getBoundingClientRect();
+      showCombo(`-8с`, rect.left + rect.width/2, rect.top + rect.height/2);
+      
+    } else if(chain.length===3){
+      // Штраф времени за 3 круга
+      scoreChange = chain.length * SCORE_PER;
+      score += scoreChange;
+      
+      // Убавляем время
+      timeLeft = Math.max(0, timeLeft - 8);
+      timerEl.textContent = timeLeft;
+      
+      // Обновляем полоску времени
+      const timeProgress = (timeLeft / GAME_TIME) * 100;
+      progressEl.style.width = timeProgress + "%";
+      
+      // Визуальные эффекты штрафа
+      scoreEl.classList.remove('bonus');
+      scoreEl.classList.add('penalty');
+      setTimeout(() => scoreEl.classList.remove('penalty'), 500);
+      
+      // Красные частицы для штрафа времени
+      [r,g,b]=[255,60,60];
+      chain.forEach(c=>{
+        const p=pos[c.r][c.c];
+        for(let i=0;i<6;i++) {
+          particles.push({
+            x:p.x,y:p.y,
+            vx:(Math.random()-0.5)*4,
+            vy:(Math.random()-0.5)*4,
+            size:Math.random()*4+2,
+            life:0.8,r,g,b
+          });
+        }
+      });
+      
+      playSound(200, 0.1, 'square', 0.02);
+      if(navigator.vibrate) navigator.vibrate(50);
+      
+      // Показать штраф времени
+      const rect = canvas.getBoundingClientRect();
+      showCombo(`-8с`, rect.left + rect.width/2, rect.top + rect.height/2);
+      
+    } else {
+      // Бонус
+      scoreChange = chain.length * SCORE_PER;
+      score += scoreChange;
+      
+      scoreEl.classList.remove('penalty');
+      scoreEl.classList.add('bonus');
+      setTimeout(() => scoreEl.classList.remove('bonus'), 500);
+      
+      // Звуковые эффекты успеха
+      playSound(500 + chain.length * 50, 0.1, 'sine', 0.04);
+      
+      // Показать бонус
+      const rect = canvas.getBoundingClientRect();
+      showCombo(`+${scoreChange}`, rect.left + rect.width/2, rect.top + rect.height/2);
+      
+      if(chain.length>=5){ 
+        // Остановка таймера
+        paused=true;
+        pauseTimeLeft = 5;
+        timerEl.classList.add('paused');
+        
+        playSound(700, 0.15, 'sine', 0.05);
+        
+        const pauseInterval = setInterval(() => {
+          pauseTimeLeft--;
+          
+          if(pauseTimeLeft <= 0) {
+            clearInterval(pauseInterval);
+            paused = false;
+            timerEl.classList.remove('paused');
+          }
+        }, 1000);
+        
+        showCombo(`ПАУЗА 5С!`, rect.left + rect.width/2, rect.top + rect.height/3);
+      }
+    }
+    
+    scoreEl.textContent=score;
+    // Полоска теперь показывает оставшееся время
+    const timeProgress = (timeLeft / GAME_TIME) * 100;
+    progressEl.style.width = timeProgress + "%";
+    
+    
+    // Нет досрочного окончания - игра продолжается все 60 секунд
+  }
+  
+  chain=[];
+  chainSet.clear(); 
+  draw();
+}
+
+/* --- UTILS --- */
+function getPos(e){
+  const rect=canvas.getBoundingClientRect();
+  const clientX=e.touches?e.touches[0].clientX:e.clientX;
+  const clientY=e.touches?e.touches[0].clientY:e.clientY;
+  return {x:clientX-rect.left,y:clientY-rect.top};
+}
+
+function hex2rgb(hex){
+  const v=parseInt(hex.slice(1),16);
+  return [v>>16&255,v>>8&255,v&255];
+}
+
+/* --- IMPROVED TIMER --- */
+function startTimer(){
+  clearInterval(timerInterval);
+  timeLeft=GAME_TIME; 
+  paused=false;
+  timerEl.textContent=timeLeft;
+  timerEl.classList.remove('paused', 'warning');
+  progressEl.style.width = "100%"; // Полная полоска в начале
+  
+  timerInterval=setInterval(()=>{
+    if(!paused){
+      timeLeft--;
+      timerEl.textContent=timeLeft;
+      
+      // Обновляем полоску времени
+      const timeProgress = (timeLeft / GAME_TIME) * 100;
+      progressEl.style.width = timeProgress + "%";
+      
+      // Предупреждение о завершении времени
+      if(timeLeft <= 10 && timeLeft > 0) {
+        timerEl.classList.add('warning');
+        if(timeLeft <= 5) {
+          playSound(800, 0.1, 'sine', 0.02);
+        }
+      }
+      
+      if(timeLeft<=0){
+        clearInterval(timerInterval);
+        gameOver=true;
+        finalScoreEl.textContent=score;
+        
+        // Поздравления основаны на достигнутом результате
+        if(score >= 1000) {
+          gameOverEl.querySelector('.gameover-title').textContent = '🔥 НЕВЕРОЯТНО!';
+          gameOverEl.querySelector('.gameover-title').style.color = '#ff6b6b';
+        } else if(score >= 800) {
+          gameOverEl.querySelector('.gameover-title').textContent = '🚀 ФАНТАСТИКА!';
+          gameOverEl.querySelector('.gameover-title').style.color = '#29d0c2';
+        } else if(score >= 600) {
+          gameOverEl.querySelector('.gameover-title').textContent = '🏆 ПРЕВОСХОДНО!';
+          gameOverEl.querySelector('.gameover-title').style.color = '#29d0c2';
+        } else if(score >= 400) {
+          gameOverEl.querySelector('.gameover-title').textContent = '🎉 ОТЛИЧНО!';
+          gameOverEl.querySelector('.gameover-title').style.color = '#f79a2b';
+        } else if(score >= 250) {
+          gameOverEl.querySelector('.gameover-title').textContent = '👏 ХОРОШО!';
+          gameOverEl.querySelector('.gameover-title').style.color = '#5b4af0';
+        } else if(score >= 100) {
+          gameOverEl.querySelector('.gameover-title').textContent = '✨ НЕПЛОХО!';
+          gameOverEl.querySelector('.gameover-title').style.color = '#9b59b6';
+        } else {
+          gameOverEl.querySelector('.gameover-title').textContent = '🎮 ВРЕМЯ ВЫШЛО!';
+          gameOverEl.querySelector('.gameover-title').style.color = '#fff';
+        }
+        gameOverEl.style.display="flex";
+      }
+    }
+  },1000);
+}
+
+/* --- ANIMATION LOOP --- */
+function loop(){
+  draw(); 
+  if(!gameOver) {
+    animationId = requestAnimationFrame(loop);
+  }
+}
+
+function startGame(){
+  if(animationId) {
+    cancelAnimationFrame(animationId);
+  }
+  
+  fillGrid();
+  score=0;
+  scoreEl.textContent=0;
+  scoreEl.classList.remove('bonus', 'penalty');
+  progressEl.style.width="100%"; // Полная полоска времени
+  chain=[];
+  chainSet.clear();
+  particles=[];
+  gameOver=false; 
+  gameOverEl.style.display="none";
+  timerEl.classList.remove('paused', 'warning');
+  
+  startTimer();
+  loop();
+}
+
+/* --- EVENT LISTENERS --- */
+restartBtn.onclick = startGame;
+playAgainBtn.onclick = startGame;
+
+canvas.addEventListener("mousedown",start);
+canvas.addEventListener("mousemove",move);
+window.addEventListener("mouseup",end);
+canvas.addEventListener("touchstart",start,{passive:false});
+canvas.addEventListener("touchmove",move,{passive:false});
+window.addEventListener("touchend",end);
+
+// Предотвращение контекстного меню на мобильных устройствах
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// Инициализация
+startGame();
+</script>
+</body>
+</html>
